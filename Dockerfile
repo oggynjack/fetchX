@@ -14,13 +14,13 @@ RUN pip install --no-cache-dir -r requirements.txt gunicorn
 
 COPY . .
 
-RUN useradd -m -u 1000 reclip && \
+RUN useradd -m -u 1000 fetchx && \
     mkdir -p /app/downloads && \
-    chown -R reclip:reclip /app
-USER reclip
+    chown -R fetchx:fetchx /app
+USER fetchx
 
-# Put the reclip user's --user installs first so startup yt-dlp updates take effect.
-ENV PATH=/home/reclip/.local/bin:$PATH
+# Put the fetchx user's --user installs first so startup yt-dlp updates take effect.
+ENV PATH=/home/fetchx/.local/bin:$PATH
 
 EXPOSE 8899
 

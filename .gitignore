@@ -1,10 +1,57 @@
-venv/
-downloads/
+# Dependencies
+node_modules/
 __pycache__/
 *.pyc
-assets/*.mov
-.DS_Store
+*.pyo
 .env
-.env.local
-.env.production
-.env.development
+venv/
+.venv/
+
+# Downloads & temp files
+downloads/
+*.mp4
+*.webm
+*.mp3
+*.wav
+*.m4a
+*.ogg
+*.jpg
+*.png
+*.gif
+!static/**/*.png
+!static/**/*.jpg
+!static/**/*.svg
+
+# Logs
+*.log
+pm2*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker
+.docker/
+
+# Freebuff (dev tool)
+.freebuff/
+
+# Ad clicker scripts (dev tools, not part of fetchX)
+ad-clicker.py
+ad-clicker-ultimate.py
+fetchx-ads-bot.png
+fetchx-ads-mid.png
+fetchx-ads-top.png
+fetchx-full.png
+
+# Test & debug files
+debug*.py
+check.png
+verify*.png

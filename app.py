@@ -1,92 +1,103 @@
+"""fetchX — Flask web app: serves the UI and queues download jobs.
+
+Workers (worker.py) pick jobs up from Redis and write progress into JSON
+status files under downloads/, which this app serves back to the browser.
+"""
+
 import os
+import json
 import uuid
 import glob
-import json
-import subprocess
+import shutil
+import time
 import threading
+import redis
+import requests as http_requests
 from flask import Flask, request, jsonify, send_file, render_template
+from rq import Queue
+
+from jobs import fetch_info, fetch_playlist, download_video, download_batch
 
 app = Flask(__name__)
+
+# Configuration
 DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-jobs = {}
+# Auto-cleanup: delete files older than 1 hour
+CLEANUP_MAX_AGE = 3600  # seconds
 
 
-def parse_ytdlp_json(stdout):
-    """Parse yt-dlp JSON output.
+def _cleanup_once():
+    """Remove downloads older than CLEANUP_MAX_AGE — files and leftover job dirs."""
+    now = time.time()
+    for path in glob.glob(os.path.join(DOWNLOAD_DIR, "*")):
+        try:
+            if now - os.path.getmtime(path) <= CLEANUP_MAX_AGE:
+                continue
+            if os.path.isfile(path):
+                os.remove(path)
+            elif os.path.isdir(path):
+                # Playlist temp dir left behind by a worker killed mid-job
+                shutil.rmtree(path, ignore_errors=True)
+        except Exception:
+            pass
 
-    With ``-j`` yt-dlp prints one JSON object per line. Some extractors
-    emit multiple videos even with ``--no-playlist``, so stdout contains
-    several objects and a plain ``json.loads`` raises "Extra data".
-    Return the first valid object.
-    """
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        return json.loads(line)
-    raise ValueError("yt-dlp returned no data")
+
+def _cleanup_old_files():
+    """Background thread — runs _cleanup_once() every 5 minutes."""
+    while True:
+        _cleanup_once()
+        time.sleep(300)
+
+cleanup_thread = threading.Thread(target=_cleanup_old_files, daemon=True)
+cleanup_thread.start()
+
+# Redis connection
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6381")
+redis_conn = redis.from_url(REDIS_URL)
+q = Queue(connection=redis_conn)
+
+# Cloudflare Turnstile
+TURNSTILE_SECRET = os.environ.get("TURNSTILE_SECRET", "")
+TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
 
 
-def run_download(job_id, url, format_choice, format_id):
-    job = jobs[job_id]
-    out_template = os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s")
+def verify_turnstile(token, ip):
+    """Verify Cloudflare Turnstile token. Returns True if valid or not configured."""
+    if not TURNSTILE_SECRET:
+        return True  # Skip verification if secret not set
 
-    cmd = ["yt-dlp", "--no-playlist", "-o", out_template]
-
-    if format_choice == "audio":
-        cmd += ["-x", "--audio-format", "mp3"]
-    elif format_id:
-        cmd += ["-f", f"{format_id}+bestaudio/best", "--merge-output-format", "mp4"]
-    else:
-        cmd += ["-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4"]
-
-    cmd.append(url)
+    if not token:
+        return False
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode != 0:
-            job["status"] = "error"
-            job["error"] = result.stderr.strip().split("\n")[-1]
-            return
+        resp = http_requests.post(TURNSTILE_VERIFY_URL, data={
+            "secret": TURNSTILE_SECRET,
+            "response": token,
+            "remoteip": ip,
+        }, timeout=10)
+        result = resp.json()
+        return result.get("success", False)
+    except Exception:
+        return False
 
-        files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{job_id}.*"))
-        if not files:
-            job["status"] = "error"
-            job["error"] = "Download completed but no file was found"
-            return
 
-        if format_choice == "audio":
-            target = [f for f in files if f.endswith(".mp3")]
-            chosen = target[0] if target else files[0]
-        else:
-            target = [f for f in files if f.endswith(".mp4")]
-            chosen = target[0] if target else files[0]
+def require_turnstile(f):
+    """Decorator: verify Turnstile token from request body before handling."""
+    from functools import wraps
 
-        for f in files:
-            if f != chosen:
-                try:
-                    os.remove(f)
-                except OSError:
-                    pass
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        data = request.get_json(silent=True) or {}
+        token = data.get("token", "")
+        ip = request.remote_addr
 
-        job["status"] = "done"
-        job["file"] = chosen
-        ext = os.path.splitext(chosen)[1]
-        title = job.get("title", "").strip()
-        # Sanitize title for filename
-        if title:
-            safe_title = "".join(c for c in title if c not in r'\/:*?"<>|').strip()[:100].strip()
-            job["filename"] = f"{safe_title}{ext}" if safe_title else os.path.basename(chosen)
-        else:
-            job["filename"] = os.path.basename(chosen)
-    except subprocess.TimeoutExpired:
-        job["status"] = "error"
-        job["error"] = "Download timed out (5 min limit)"
-    except Exception as e:
-        job["status"] = "error"
-        job["error"] = str(e)
+        if not verify_turnstile(token, ip):
+            return jsonify({"error": "Verification failed. Please complete the captcha."}), 403
+
+        return f(*args, **kwargs)
+    return decorated
 
 
 @app.route("/")
@@ -94,117 +105,152 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/privacy")
+def privacy():
+    return render_template("privacy.html")
+
+
+@app.route("/terms")
+def terms():
+    return render_template("terms.html")
+
+
 @app.route("/api/info", methods=["POST"])
+@require_turnstile
 def get_info():
     data = request.json
     url = data.get("url", "").strip()
     if not url:
         return jsonify({"error": "No URL provided"}), 400
 
-    cmd = ["yt-dlp", "--no-playlist", "-j", url]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        if result.returncode != 0:
-            return jsonify({"error": result.stderr.strip().split("\n")[-1]}), 400
-
-        info = parse_ytdlp_json(result.stdout)
-
-        # Build quality options — keep best format per resolution
-        best_by_height = {}
-        for f in info.get("formats", []):
-            height = f.get("height")
-            if height and f.get("vcodec", "none") != "none":
-                tbr = f.get("tbr") or 0
-                if height not in best_by_height or tbr > (best_by_height[height].get("tbr") or 0):
-                    best_by_height[height] = f
-
-        formats = []
-        for height, f in best_by_height.items():
-            formats.append({
-                "id": f["format_id"],
-                "label": f"{height}p",
-                "height": height,
-            })
-        formats.sort(key=lambda x: x["height"], reverse=True)
-
-        return jsonify({
-            "title": info.get("title", ""),
-            "thumbnail": info.get("thumbnail", ""),
-            "duration": info.get("duration"),
-            "uploader": info.get("uploader", ""),
-            "formats": formats,
-        })
-    except subprocess.TimeoutExpired:
-        return jsonify({"error": "Timed out fetching video info"}), 400
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
+    result = fetch_info(url)
+    if "error" in result:
+        return jsonify(result), 400
+    return jsonify(result)
 
 
 @app.route("/api/playlist", methods=["POST"])
+@require_turnstile
 def get_playlist_info():
     data = request.json
     url = data.get("url", "").strip()
     if not url:
         return jsonify({"error": "No URL provided"}), 400
 
-    cmd = ["yt-dlp", "--flat-playlist", "-J", url]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        if result.returncode != 0:
-            return jsonify({"error": result.stderr.strip().split("\n")[-1]}), 400
-
-        info = json.loads(result.stdout)
-        entries = info.get("entries", [])
-        urls = [entry.get("url") for entry in entries if entry.get("url")]
-        return jsonify({"urls": urls})
-    except subprocess.TimeoutExpired:
-        return jsonify({"error": "Timed out fetching playlist info"}), 400
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
+    result = fetch_playlist(url)
+    if "error" in result:
+        return jsonify(result), 400
+    return jsonify(result)
 
 
 @app.route("/api/download", methods=["POST"])
+@require_turnstile
 def start_download():
     data = request.json
     url = data.get("url", "").strip()
     format_choice = data.get("format", "video")
     format_id = data.get("format_id")
     title = data.get("title", "")
+    lang = data.get("lang", "")
 
     if not url:
         return jsonify({"error": "No URL provided"}), 400
 
     job_id = uuid.uuid4().hex[:10]
-    jobs[job_id] = {"status": "downloading", "url": url, "title": title}
 
-    thread = threading.Thread(target=run_download, args=(job_id, url, format_choice, format_id))
-    thread.daemon = True
-    thread.start()
+    # Enqueue job to Redis
+    job = q.enqueue(
+        download_video,
+        job_id, url, format_choice, format_id, title, DOWNLOAD_DIR, lang,
+        job_timeout="10m",
+        result_ttl=3600,
+    )
+
+    # Initialize job file
+    job_file = os.path.join(DOWNLOAD_DIR, f"{job_id}.json")
+    with open(job_file, "w") as f:
+        json.dump({"status": "queued", "rq_job_id": job.id}, f)
+
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/api/batch", methods=["POST"])
+@require_turnstile
+def start_batch():
+    data = request.json
+    urls = data.get("urls") or []
+    format_choice = data.get("format", "video")
+    title = data.get("title", "")
+
+    if isinstance(urls, str):
+        urls = [urls]
+    urls = [u.strip() for u in urls if isinstance(u, str) and u.strip()][:40]
+    if not urls:
+        return jsonify({"error": "No URLs provided"}), 400
+
+    job_id = uuid.uuid4().hex[:10]
+
+    job = q.enqueue(
+        download_batch,
+        job_id, urls, format_choice, DOWNLOAD_DIR, title,
+        job_timeout="30m",
+        result_ttl=3600,
+    )
+
+    job_file = os.path.join(DOWNLOAD_DIR, f"{job_id}.json")
+    with open(job_file, "w") as f:
+        json.dump({"status": "queued", "rq_job_id": job.id}, f)
 
     return jsonify({"job_id": job_id})
 
 
 @app.route("/api/status/<job_id>")
 def check_status(job_id):
-    job = jobs.get(job_id)
-    if not job:
+    job_file = os.path.join(DOWNLOAD_DIR, f"{job_id}.json")
+    if not os.path.exists(job_file):
         return jsonify({"error": "Job not found"}), 404
+
+    with open(job_file, "r") as f:
+        data = json.load(f)
+
     return jsonify({
-        "status": job["status"],
-        "error": job.get("error"),
-        "filename": job.get("filename"),
+        "status": data.get("status", "unknown"),
+        "error": data.get("error"),
+        "filename": data.get("filename"),
+        "progress": data.get("progress", 0),
+        "speed": data.get("speed"),
+        "eta": data.get("eta"),
+        "file": data.get("file"),
+        "files": data.get("files"),
     })
 
 
 @app.route("/api/file/<job_id>")
 def download_file(job_id):
-    job = jobs.get(job_id)
-    if not job or job["status"] != "done":
+    job_file = os.path.join(DOWNLOAD_DIR, f"{job_id}.json")
+    if not os.path.exists(job_file):
         return jsonify({"error": "File not ready"}), 404
-    return send_file(job["file"], as_attachment=True, download_name=job["filename"])
+
+    with open(job_file, "r") as f:
+        data = json.load(f)
+
+    if data.get("status") != "done" or not data.get("file"):
+        return jsonify({"error": "File not ready"}), 404
+
+    return send_file(data["file"], as_attachment=True, download_name=data.get("filename", "download"))
+
+
+@app.route("/api/queue/stats")
+def queue_stats():
+    return jsonify({
+        "queued": len(q),
+        "started": len(q.started_job_registry),
+        "finished": len(q.finished_job_registry),
+        "failed": len(q.failed_job_registry),
+    })
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8899))
-    host = os.environ.get("HOST", "127.0.0.1")
-    app.run(host=host, port=port)
+    host = os.environ.get("HOST", "0.0.0.0")
+    app.run(host=host, port=port, debug=False)
